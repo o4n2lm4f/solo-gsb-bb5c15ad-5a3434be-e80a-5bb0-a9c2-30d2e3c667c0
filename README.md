@@ -55,6 +55,13 @@ local working hours.
   declares `TRANSP` replaces it), `DATE` all-day events occupy local full
   days in the calendar's own timezone (DST-correct), and the clipped busy
   intervals are merged into sorted `FREEBUSY` lines
+- `/fair-rotation` schedules a **rotating cross-timezone meeting series**:
+  given the organizer's timezone, one candidate local start time list per
+  organizer-local date, a duration, and participants (IANA timezone + busy
+  ICS + preferred local periods), it picks one feasible candidate per date
+  — jointly across all dates — minimizing first the largest per-participant
+  cumulative deviation from the preferred periods, then the total
+  deviation, then candidate input order
 - Results sorted by UTC start time, then `UID` (stable)
 - Clear `422` errors for invalid rules, unknown timezones, or bad input
 
@@ -1145,6 +1152,136 @@ hold blocks nothing; Bob contributes one UTC meeting:
 }
 ```
 
+### `POST /fair-rotation`
+
+Schedules a **rotating meeting series** across timezones: one meeting per
+organizer-local date, chosen jointly so the burden of awkward hours is
+shared fairly. Request body:
+
+| Field                 | Type    | Description                                                  |
+| --------------------- | ------- | ------------------------------------------------------------ |
+| `organizer_timezone`  | string  | IANA timezone in which `dates` and their `candidates` are local, e.g. `America/New_York` |
+| `duration_minutes`    | integer | Meeting length in minutes (must be > 0)                      |
+| `dates`               | array   | Non-empty list of `{date, candidates}` (see below)           |
+| `participants`        | array   | Objects with `name`, `timezone`, `busy_ics`, `preferred_periods` (see below); may be empty or omitted |
+
+Each `dates` entry carries an organizer-local `date` (`YYYY-MM-DD`) and a
+non-empty `candidates` list of local start times (`HH:MM`, optionally with
+seconds; no timezone offset). Each `participants` entry carries:
+
+| Field               | Type   | Description                                                   |
+| ------------------- | ------ | ------------------------------------------------------------- |
+| `name`              | string | Non-empty identifier, unique within the request               |
+| `timezone`          | string | IANA timezone of the participant, e.g. `Europe/Berlin`        |
+| `busy_ics`          | string | iCalendar text with the participant's busy events; empty or omitted means no busy time |
+| `preferred_periods` | array  | Preferred local `{start, end}` time-of-day periods (naive, `end > start`, no overnight); empty or omitted means nothing is preferred |
+
+Every candidate is materialized on its organizer-local date with
+`zoneinfo` (DST-correct in every involved timezone) and converted to UTC.
+A candidate is **feasible** when its meeting interval overlaps no
+participant's busy time; busy time is expanded from each `busy_ics` with
+the same recurrence engine as `/expand` (`STATUS:CANCELLED` and
+zero-duration instances never block). Each meeting costs a participant the
+minutes of its interval falling outside the participant's preferred local
+periods (materialized per local date in the participant's own timezone),
+and the costs accumulate over all dates. The plan minimizes, in order:
+
+1. the largest per-participant cumulative deviation,
+2. the total deviation over all participants,
+3. candidate input order (earlier dates, then earlier candidates win).
+
+The response echoes the objectives and lists the chosen meeting per date
+(organizer-local `date`, `candidate_index` into the date's `candidates`,
+UTC `start`/`end`, organizer-local `local_start`/`local_end`, and the
+per-participant deviation of that meeting) plus each participant's
+`cumulative_deviation_minutes`:
+
+| Field                              | Type   | Description                                 |
+| ---------------------------------- | ------ | ------------------------------------------- |
+| `organizer_timezone`               | string | Echo of the request                         |
+| `duration_minutes`                 | int    | Echo of the request                         |
+| `meeting_count`                    | int    | Number of meetings (one per date)           |
+| `max_cumulative_deviation_minutes` | number | Primary objective value                     |
+| `total_deviation_minutes`          | number | Secondary objective value                   |
+| `meetings`                         | array  | One entry per date, in request order        |
+| `participants`                     | array  | One entry per participant, in request order |
+
+### Example
+
+```bash
+curl -s http://localhost:8000/fair-rotation \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "organizer_timezone": "America/New_York",
+    "duration_minutes": 60,
+    "dates": [
+      {"date": "2026-03-09", "candidates": ["09:00", "12:00", "16:00"]},
+      {"date": "2026-03-10", "candidates": ["09:00", "12:00", "16:00"]}
+    ],
+    "participants": [
+      {
+        "name": "alice",
+        "timezone": "Europe/Berlin",
+        "busy_ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:a1\r\nDTSTART:20260309T133000Z\r\nDTEND:20260309T143000Z\r\nSUMMARY:Alice busy\r\nEND:VEVENT\r\nEND:VCALENDAR",
+        "preferred_periods": [{"start": "09:00", "end": "18:00"}]
+      },
+      {
+        "name": "bob",
+        "timezone": "Asia/Tokyo",
+        "preferred_periods": [{"start": "09:00", "end": "18:00"}]
+      }
+    ]
+  }'
+```
+
+New York is already on EDT (UTC−4) while Berlin is still on CET (UTC+1).
+On March 9 the 09:00 candidate (13:00–14:00Z) collides with Alice's busy
+event, so 12:00 (17:00–18:00 in Berlin) is chosen; on March 10 the 09:00
+candidate is free and preferred for Alice. Every candidate falls outside
+Bob's 09:00–18:00 JST preference, so he accumulates 60 minutes per meeting
+— the joint plan cannot do better for him, and among the plans that are
+equally good for him it minimizes Alice's total:
+
+```json
+{
+  "organizer_timezone": "America/New_York",
+  "duration_minutes": 60,
+  "meeting_count": 2,
+  "max_cumulative_deviation_minutes": 120,
+  "total_deviation_minutes": 120,
+  "meetings": [
+    {
+      "date": "2026-03-09",
+      "candidate_index": 1,
+      "start": "2026-03-09T16:00:00Z",
+      "end": "2026-03-09T17:00:00Z",
+      "local_start": "2026-03-09T12:00:00-04:00",
+      "local_end": "2026-03-09T13:00:00-04:00",
+      "deviations": [
+        {"participant": "alice", "deviation_minutes": 0},
+        {"participant": "bob", "deviation_minutes": 60}
+      ]
+    },
+    {
+      "date": "2026-03-10",
+      "candidate_index": 0,
+      "start": "2026-03-10T13:00:00Z",
+      "end": "2026-03-10T14:00:00Z",
+      "local_start": "2026-03-10T09:00:00-04:00",
+      "local_end": "2026-03-10T10:00:00-04:00",
+      "deviations": [
+        {"participant": "alice", "deviation_minutes": 0},
+        {"participant": "bob", "deviation_minutes": 60}
+      ]
+    }
+  ],
+  "participants": [
+    {"name": "alice", "timezone": "Europe/Berlin", "cumulative_deviation_minutes": 0},
+    {"name": "bob", "timezone": "Asia/Tokyo", "cumulative_deviation_minutes": 120}
+  ]
+}
+```
+
 ### Errors (`422 Unprocessable Entity`)
 
 Returned with a descriptive `detail` message for: unparsable iCalendar
@@ -1218,6 +1355,17 @@ unknown `timezone` (non-IANA name), a `TRANSP` value other than
 `OPAQUE`/`TRANSPARENT`, and every calendar-level failure of `/expand`
 (unparsable ICS, invalid `RRULE`, unknown `TZID`, missing
 `DTSTART`/`UID`, the 10 000-occurrence cap).
+
+`/fair-rotation` returns `422` for: an unknown `organizer_timezone` or
+participant `timezone` (non-IANA name), a duplicate participant `name`, a
+non-positive `duration_minutes`, an empty `dates` list or a date with an
+empty `candidates` list, an offset-bearing candidate or preferred-period
+time, a preferred period with `end <= start` (overnight periods are not
+supported), an unparsable participant `busy_ics` (including every
+calendar-level failure of `/expand`), an organizer date on which **no
+candidate is feasible** for every participant at once, and a joint search
+space — the product of the per-date feasible candidate counts — exceeding
+**50 000** combinations.
 
 ## Semantics and limitations
 
@@ -1440,6 +1588,47 @@ unknown `timezone` (non-IANA name), a `TRANSP` value other than
   as `/expand`; it only competes when the expanded start/end set equals the
   submitted set exactly, so the returned `ics` always re-expands faithfully.
 
+### Fair rotation semantics
+
+- **Candidates are organizer-local**: each candidate is the wall-clock time
+  on its organizer-local `date` in `organizer_timezone`, materialized with
+  `zoneinfo` and converted to UTC — so the same local time maps to
+  different UTC instants across a DST transition, and every participant's
+  view of the meeting follows their own zone's DST rules. The meeting
+  occupies the half-open interval `[start, start + duration)` in UTC.
+- **Feasibility reuses the expansion engine**: each participant's
+  `busy_ics` is expanded with the exact `/expand` semantics (overrides,
+  `EXDATE`, floating times, the 10 000-occurrence cap) over the span of all
+  candidates; an instance blocks a candidate when it is not
+  `STATUS:CANCELLED`, has a positive duration, and its half-open interval
+  overlaps the meeting (a busy event merely touching the meeting's start
+  or end does not). A blank `busy_ics` means the participant has no busy
+  time. A candidate is feasible only when it is conflict-free for **every**
+  participant; an organizer date left without any feasible candidate fails
+  the request with `422`.
+- **Deviation is measured per participant in local time**: a meeting costs
+  a participant the minutes of its interval that fall outside the
+  participant's `preferred_periods`, materialized per local date in the
+  participant's own `timezone` (DST-correct, like `/availability` working
+  hours; overlapping preferred periods count once). A meeting fully inside
+  a preferred period costs 0, one fully outside costs its whole duration,
+  and a participant with no preferred periods always deviates by the full
+  duration. Costs accumulate over all dates into the participant's
+  **cumulative deviation**.
+- **Joint optimization**: exactly one candidate is chosen per date by
+  enumerating the joint combinations (capped at 50 000; larger spaces are
+  rejected with `422`). The plan lexicographically minimizes (1) the
+  largest per-participant cumulative deviation, (2) the total deviation
+  summed over all participants, and (3) candidate input order — earlier
+  dates, then earlier candidates within their date, win remaining ties.
+- **Response**: `meetings` lists one entry per date in request order with
+  the chosen `candidate_index`, the UTC `start`/`end` (`Z`), the
+  organizer-local `local_start`/`local_end` (offset-bearing), and the
+  per-participant deviation of that meeting in participant request order;
+  `participants` echoes each participant with their cumulative deviation.
+  All minute values are integers when the inputs are minute-aligned
+  (fractional only for sub-minute candidate or preference times).
+
 ## Development
 
 ```bash
@@ -1456,7 +1645,7 @@ app/main.py          FastAPI app: POST /expand, POST /provenance,
                      POST /attendance, POST /calendar-diff,
                      POST /availability, POST /conflicts, POST /validate,
                      POST /compress-schedule, POST /freebusy-export,
-                     GET /health
+                     POST /fair-rotation, GET /health
 app/expander.py      recurrence expansion, override merging, TZ/DST handling
 app/provenance.py    per-occurrence provenance chains (RRULE/RDATE/DTSTART
                      generation, EXDATE, RECURRENCE-ID override, final values)
@@ -1469,6 +1658,8 @@ app/diff.py          two-calendar instance diff by UID + RECURRENCE-ID
 app/availability.py  working-period timeline, busy clipping/merge, free complement
 app/conflicts.py     half-open sweep for minimum-concurrency segments
 app/freebusy.py      TRANSP-aware busy periods, all-day local days, VFREEBUSY text
+app/rotation.py      joint fair-rotation plan: DST-correct candidates, busy
+                     filtering, deviation costs, lexicographic objectives
 tests/               key tests for all endpoints (recurrences, DST, 422s)
 Dockerfile           python:3.12-slim image running uvicorn on port 8000
 docker-compose.yml   single-command startup

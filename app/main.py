@@ -23,6 +23,14 @@ from .availability import (
     busy_intervals,
     common_free_slots,
 )
+from .rotation import (
+    ChosenMeeting,
+    ParticipantSpec,
+    RotationError,
+    RotationPlan,
+    minutes_from_micros,
+    plan_fair_rotation,
+)
 from .compressor import CompressionError, compress_instances
 from .conflicts import ConflictSegment, ConflictsError, Participant, find_conflicts
 from .diff import CalendarDiff, diff_calendars
@@ -36,13 +44,21 @@ from .provenance import (
     SeriesProvenance,
     provenance_for_uid,
 )
+from .rotation import (
+    ChosenMeeting,
+    ParticipantSpec,
+    RotationError,
+    RotationPlan,
+    minutes_from_micros,
+    plan_fair_rotation,
+)
 from .validation import Issue, validate_ics
 
 UTC = dt.timezone.utc
 
 app = FastAPI(
     title="iCalendar Recurrence Expansion and Availability API",
-    version="1.10.0",
+    version="1.11.0",
     summary="Expand DTSTART/RRULE/RDATE/EXDATE and RECURRENCE-ID overrides "
     "into concrete UTC instances, trace the per-occurrence provenance chain "
     "(generation, EXDATE exclusion, RECURRENCE-ID reschedule/cancel) of one "
@@ -51,8 +67,10 @@ app = FastAPI(
     "segments across named calendars, expand VALARM reminders, report "
     "per-instance ATTENDEE participation status inside a query window, "
     "compress a set of equal-length UTC instances into the shortest "
-    "recurrence ICS, validate raw iCalendar text structurally, and export "
-    "per-calendar VFREEBUSY busy periods over a UTC window.",
+    "recurrence ICS, validate raw iCalendar text structurally, export "
+    "per-calendar VFREEBUSY busy periods over a UTC window, and schedule a "
+    "fair cross-timezone rotation of meetings that minimizes the largest "
+    "per-participant cumulative deviation from preferred local periods.",
 )
 
 
@@ -576,6 +594,26 @@ def _participant_out(participant: Participant) -> ParticipantOut:
     )
 
 
+def _rotation_meeting_out(
+    meeting: ChosenMeeting, participants: list[RotationParticipant]
+) -> RotationMeetingOut:
+    return RotationMeetingOut(
+        date=meeting.date,
+        candidate_index=meeting.candidate_index,
+        start=meeting.start,
+        end=meeting.end,
+        local_start=meeting.local_start,
+        local_end=meeting.local_end,
+        deviations=[
+            MeetingDeviationOut(
+                participant=participants[index].name,
+                deviation_minutes=minutes_from_micros(micros),
+            )
+            for index, micros in enumerate(meeting.deviations)
+        ],
+    )
+
+
 def _issue_out(issue: Issue) -> IssueOut:
     return IssueOut(
         code=issue.code,
@@ -742,6 +780,164 @@ class FreeBusyExportResponse(BaseModel):
     @field_serializer("window_start", "window_end")
     def _serialize_window(self, value: dt.datetime) -> str:
         return _iso_z(value)
+
+
+# ---------------------------------------------------------------------------
+# POST /fair-rotation
+# ---------------------------------------------------------------------------
+
+
+class PreferredPeriod(BaseModel):
+    """One preferred local period within a day (wall-clock times, no zone)."""
+
+    model_config = {"extra": "forbid"}
+
+    start: dt.time = Field(
+        ..., description="Local start time, e.g. '09:00' (no timezone offset)"
+    )
+    end: dt.time = Field(
+        ..., description="Local end time, same local date as start"
+    )
+
+    @model_validator(mode="after")
+    def _validate_period(self) -> "PreferredPeriod":
+        if self.start.tzinfo is not None or self.end.tzinfo is not None:
+            raise ValueError("preferred periods must be naive local times (no offset)")
+        if self.start >= self.end:
+            raise ValueError(
+                "preferred period end must be after start on the same local "
+                "date (overnight periods are not supported)"
+            )
+        return self
+
+
+class RotationDate(BaseModel):
+    """One organizer-local date and its candidate local start times."""
+
+    model_config = {"extra": "forbid"}
+
+    date: dt.date = Field(
+        ..., description="Organizer-local calendar date, e.g. '2026-03-09'"
+    )
+    candidates: list[dt.time] = Field(
+        ...,
+        min_length=1,
+        description="Candidate local start times in the organizer timezone, "
+        "e.g. ['09:00', '13:30'] (no timezone offset)",
+    )
+
+    @field_validator("candidates")
+    @classmethod
+    def _naive_candidates(cls, value: list[dt.time]) -> list[dt.time]:
+        for item in value:
+            if item.tzinfo is not None:
+                raise ValueError(
+                    "candidate times must be naive local times (no offset)"
+                )
+        return value
+
+
+class RotationParticipant(BaseModel):
+    """One participant: timezone, busy calendar and preferred local periods."""
+
+    model_config = {"extra": "forbid"}
+
+    name: str = Field(
+        ..., min_length=1, description="Identifier echoed back with the costs"
+    )
+    timezone: str = Field(
+        ...,
+        min_length=1,
+        description="IANA timezone of the participant, e.g. 'Europe/Berlin'",
+    )
+    busy_ics: str = Field(
+        default="",
+        description="iCalendar (RFC 5545) text with the participant's busy "
+        "events; empty means no busy time",
+    )
+    preferred_periods: list[PreferredPeriod] = Field(
+        default_factory=list,
+        description="Preferred local time-of-day periods; meeting time "
+        "outside them counts as deviation. Empty means nothing is preferred.",
+    )
+
+
+class FairRotationRequest(BaseModel):
+    organizer_timezone: str = Field(
+        ...,
+        min_length=1,
+        description="IANA timezone in which dates and candidate times are "
+        "expressed, e.g. 'America/New_York'",
+    )
+    duration_minutes: int = Field(
+        ..., gt=0, description="Meeting length in minutes (must be > 0)"
+    )
+    dates: list[RotationDate] = Field(
+        ...,
+        min_length=1,
+        description="Organizer-local dates, each with at least one candidate",
+    )
+    participants: list[RotationParticipant] = Field(
+        default_factory=list,
+        description="Participants to schedule fairly; may be empty. "
+        "name values must be unique.",
+    )
+
+
+class MeetingDeviationOut(BaseModel):
+    participant: str
+    deviation_minutes: int | float = Field(
+        ..., description="Minutes of this meeting outside the participant's "
+        "preferred local periods"
+    )
+
+
+class RotationMeetingOut(BaseModel):
+    date: dt.date = Field(..., description="Organizer-local date of the meeting")
+    candidate_index: int = Field(
+        ..., description="0-based index of the chosen candidate in the date's "
+        "candidate list"
+    )
+    start: dt.datetime = Field(..., description="Meeting start (UTC, Z)")
+    end: dt.datetime = Field(..., description="Meeting end (UTC, Z)")
+    local_start: dt.datetime = Field(
+        ..., description="Meeting start in the organizer timezone"
+    )
+    local_end: dt.datetime = Field(
+        ..., description="Meeting end in the organizer timezone"
+    )
+    deviations: list[MeetingDeviationOut] = Field(
+        ..., description="Per-participant deviation of this meeting, in "
+        "participant request order"
+    )
+
+    @field_serializer("start", "end")
+    def _serialize_dt(self, value: dt.datetime) -> str:
+        return _iso_z(value)
+
+
+class RotationParticipantOut(BaseModel):
+    name: str
+    timezone: str
+    cumulative_deviation_minutes: int | float = Field(
+        ..., description="This participant's deviation summed over all meetings"
+    )
+
+
+class FairRotationResponse(BaseModel):
+    organizer_timezone: str
+    duration_minutes: int
+    meeting_count: int
+    max_cumulative_deviation_minutes: int | float = Field(
+        ..., description="Largest per-participant cumulative deviation "
+        "(the primary objective)"
+    )
+    total_deviation_minutes: int | float = Field(
+        ..., description="Deviation summed over all participants and meetings "
+        "(the secondary objective)"
+    )
+    meetings: list[RotationMeetingOut]
+    participants: list[RotationParticipantOut]
 
 
 @app.get("/health")
@@ -1022,4 +1218,48 @@ def freebusy_export(request: FreeBusyExportRequest) -> FreeBusyExportResponse:
         window_end=window_end,
         count=len(exports),
         calendars=exports,
+    )
+
+
+@app.post("/fair-rotation", response_model=FairRotationResponse)
+def fair_rotation(request: FairRotationRequest) -> FairRotationResponse:
+    participants = [
+        ParticipantSpec(
+            name=participant.name,
+            timezone=participant.timezone,
+            busy_ics=participant.busy_ics,
+            preferred=tuple(
+                LocalRange(start=period.start, end=period.end)
+                for period in participant.preferred_periods
+            ),
+        )
+        for participant in request.participants
+    ]
+    try:
+        plan: RotationPlan = plan_fair_rotation(
+            request.organizer_timezone,
+            [(entry.date, tuple(entry.candidates)) for entry in request.dates],
+            dt.timedelta(minutes=request.duration_minutes),
+            participants,
+        )
+    except RotationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return FairRotationResponse(
+        organizer_timezone=request.organizer_timezone,
+        duration_minutes=request.duration_minutes,
+        meeting_count=len(plan.meetings),
+        max_cumulative_deviation_minutes=minutes_from_micros(plan.max_cumulative),
+        total_deviation_minutes=minutes_from_micros(plan.total),
+        meetings=[
+            _rotation_meeting_out(meeting, request.participants)
+            for meeting in plan.meetings
+        ],
+        participants=[
+            RotationParticipantOut(
+                name=participant.name,
+                timezone=participant.timezone,
+                cumulative_deviation_minutes=minutes_from_micros(micros),
+            )
+            for participant, micros in zip(request.participants, plan.cumulative)
+        ],
     )
